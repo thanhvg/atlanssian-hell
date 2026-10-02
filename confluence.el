@@ -9,8 +9,9 @@
 ;;   M-x confluence-search         search (plain text, or raw CQL if it has = or ~)
 ;;   M-x confluence-open-page      open a page by numeric id
 ;;
-;; In a page buffer: RET follows a link (Confluence page links stay in
-;; Emacs), v opens the page in the browser, g reloads, q quits.
+;; In a page buffer: RET follows a link or breadcrumb entry (Confluence page
+;; links stay in Emacs), ^ opens the parent page, v opens the page in the
+;; browser, g reloads, q quits.
 ;;
 ;; Requests are synchronous, so Emacs blocks for the round trip.
 
@@ -24,7 +25,7 @@
 
 (defgroup confluence nil "Confluence reader." :group 'applications)
 
-(defcustom confluence-bridge-url "http://127.0.0.1:3979"
+(defcustom confluence-bridge-url "http://127.0.0.1:1979"
   "Base URL of the bridge server's REST API."
   :type 'string)
 
@@ -100,6 +101,7 @@
   (let ((m (make-sparse-keymap)))
     (define-key m (kbd "v") #'confluence-browse-page)
     (define-key m (kbd "g") #'confluence-reload)
+    (define-key m (kbd "^") #'confluence-open-parent)
     m))
 
 (define-derived-mode confluence-mode special-mode "Confluence"
@@ -148,12 +150,33 @@
         (put-text-property pos end 'keymap confluence-link-map))
       (setq pos end))))
 
+;; Folders and other non-page ancestors can't be opened as pages, so only
+;; "page" ancestors (or ones with no type given) become buttons.
+(defun confluence--ancestor-page-p (a)
+  (and (alist-get 'id a) (member (alist-get 'type a) '("page" nil))))
+
+(defun confluence--insert-breadcrumb (ancestors)
+  "Insert ANCESTORS as a \"A > B > C\" trail of buttons that open each page."
+  (let ((first t))
+    (dolist (a ancestors)
+      (unless first (insert " > "))
+      (setq first nil)
+      (let ((id (alist-get 'id a))
+            (title (or (alist-get 'title a) "?")))
+        (if (confluence--ancestor-page-p a)
+            (insert-text-button
+             title
+             'face 'button          ; explicit, so the header's `shadow' is merged behind it
+             'follow-link t
+             'help-echo (format "RET: open %s" title)
+             'action (lambda (_) (confluence-open-page id)))
+          (insert title))))))
+
 (defun confluence--render (page)
   "Render PAGE (alist from the API) into the current buffer."
   (let* ((title (alist-get 'title page))
          (space (alist-get 'name (alist-get 'space page)))
-         (crumbs (mapconcat (lambda (a) (alist-get 'title a))
-                            (alist-get 'ancestors page) " > "))
+         (ancestors (alist-get 'ancestors page))
          (when-str (alist-get 'when (alist-get 'version page)))
          (labels (mapcar (lambda (l) (alist-get 'name l))
                          (alist-get 'results (alist-get 'labels (alist-get 'metadata page)))))
@@ -165,15 +188,22 @@
          (inhibit-read-only t))
     (erase-buffer)
     (insert (propertize title 'face 'bold) "\n")
-    (insert (propertize
-             (string-join
-              (delq nil (list (and space (format "Space: %s" space))
-                              (and (not (string-empty-p crumbs)) crumbs)
-                              (and when-str (format "Updated: %s" when-str))
-                              (and labels (format "Labels: %s" (string-join labels ", ")))))
-              "  |  ")
-             'face 'shadow)
-            "\n\n")
+    (let ((parts
+           (delq nil
+                 (list (and space (lambda () (insert (format "Space: %s" space))))
+                       (and ancestors (lambda () (confluence--insert-breadcrumb ancestors)))
+                       (and when-str (lambda () (insert (format "Updated: %s" when-str))))
+                       (and labels (lambda ()
+                                     (insert (format "Labels: %s" (string-join labels ", "))))))))
+          (start (point))
+          (first t))
+      (dolist (part parts)
+        (unless first (insert "  |  "))
+        (setq first nil)
+        (funcall part))
+      ;; append, so the buttons keep their own face
+      (add-face-text-property start (point) 'shadow t))
+    (insert "\n\n")
     (shr-insert-document dom)
     (confluence--hijack-links)
     (goto-char (point-min))))
@@ -249,6 +279,14 @@
          (webui (alist-get 'webui links)))
     (unless (and base webui) (user-error "No URL known for this page"))
     (browse-url (concat base webui))))
+
+(defun confluence-open-parent ()
+  "Open the parent of the current page."
+  (interactive)
+  (let ((parent (car (last (seq-filter #'confluence--ancestor-page-p
+                                       (alist-get 'ancestors confluence--page))))))
+    (unless parent (user-error "This page has no parent page"))
+    (confluence-open-page (alist-get 'id parent))))
 
 (defun confluence-reload ()
   "Reload the page in this buffer."
