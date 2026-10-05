@@ -25,7 +25,7 @@
 
 (defgroup confluence nil "Confluence reader." :group 'applications)
 
-(defcustom confluence-bridge-url "http://127.0.0.1:1979"
+(defcustom confluence-bridge-url "http://127.0.0.1:3979"
   "Base URL of the bridge server's REST API."
   :type 'string)
 
