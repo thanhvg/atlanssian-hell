@@ -8,10 +8,14 @@
 ;;   M-x confluence-open-current   open the page your browser tab is on
 ;;   M-x confluence-search         search (plain text, or raw CQL if it has = or ~)
 ;;   M-x confluence-open-page      open a page by numeric id
+;;   M-x confluence-show-hierarchy page tree around the current page (`t' in a page)
 ;;
 ;; In a page buffer: RET follows a link or breadcrumb entry (Confluence page
 ;; links stay in Emacs), ^ opens the parent page, v opens the page in the
-;; browser, g reloads, q quits.
+;; browser, g reloads, t shows the page hierarchy, q quits.
+;;
+;; In the hierarchy buffer: RET opens the page on the line, TAB expands or
+;; collapses it (children are fetched on first expand), g rebuilds the tree.
 ;;
 ;; Requests are synchronous, so Emacs blocks for the round trip.
 
@@ -22,6 +26,8 @@
 (require 'shr)
 (require 'dom)
 (require 'subr-x)
+(require 'seq)
+(require 'cl-lib)
 
 (defgroup confluence nil "Confluence reader." :group 'applications)
 
@@ -102,6 +108,7 @@
     (define-key m (kbd "v") #'confluence-browse-page)
     (define-key m (kbd "g") #'confluence-reload)
     (define-key m (kbd "^") #'confluence-open-parent)
+    (define-key m (kbd "t") #'confluence-show-hierarchy)
     m))
 
 (define-derived-mode confluence-mode special-mode "Confluence"
@@ -298,6 +305,193 @@
       (setq confluence--page page)
       (confluence--render page)
       (goto-char (min pos (point-max))))))
+
+;;;; Page hierarchy
+
+(defface confluence-tree-current
+  '((t :inherit (bold highlight)))
+  "Face for the page the hierarchy was built around."
+  :group 'confluence)
+
+(cl-defstruct (confluence-node (:constructor confluence--node-create))
+  id title type children loaded expanded)
+
+(defvar-local confluence--tree-root nil "Root `confluence-node' of this tree.")
+(defvar-local confluence--tree-current nil "Id of the page the tree was built around.")
+(defvar-local confluence--tree-space nil "Space name shown in the header.")
+
+(defun confluence--node-from (alist)
+  (confluence--node-create :id (alist-get 'id alist)
+                           :title (or (alist-get 'title alist) "?")
+                           :type (alist-get 'type alist)))
+
+(defun confluence--fetch-children (id)
+  "Return all child pages of ID as a list of alists, following pagination."
+  (let ((all nil) (start 0) (more t) (n 0))
+    (while (and more (< n 10))
+      (let* ((data (confluence--call "children" `((id . ,id) (start . ,start) (limit . 100))))
+             (results (alist-get 'results data)))
+        (setq all (append all results)
+              start (+ start (length results))
+              n (1+ n)
+              more (and results (alist-get 'next (alist-get '_links data))))))
+    all))
+
+(defun confluence--node-load (node &optional must-include)
+  "Fetch NODE's children and mark it loaded and expanded.
+MUST-INCLUDE, an alist for a child that has to appear (the next step on the
+path to the current page), is added if the listing lacks it, and errors from
+the listing are tolerated; some ancestors, such as folders, may not list
+children as pages."
+  (let* ((id (confluence-node-id node))
+         (raw (if must-include
+                  (condition-case nil (confluence--fetch-children id)
+                    (user-error nil))
+                (confluence--fetch-children id)))
+         (kids (mapcar #'confluence--node-from raw)))
+    (when (and must-include
+               (not (seq-find (lambda (k)
+                                (equal (confluence-node-id k) (alist-get 'id must-include)))
+                              kids)))
+      (setq kids (append kids (list (confluence--node-from must-include)))))
+    (setf (confluence-node-children node) kids
+          (confluence-node-loaded node) t
+          (confluence-node-expanded node) t)
+    kids))
+
+(defun confluence--build-tree (page)
+  "Build a tree for PAGE: the ancestor path with siblings, and PAGE's children."
+  (let* ((self `((id . ,(alist-get 'id page))
+                 (title . ,(alist-get 'title page))
+                 (type . "page")))
+         (path (append (seq-filter (lambda (a) (alist-get 'id a))
+                                   (alist-get 'ancestors page))
+                       (list self)))
+         (root (confluence--node-from (car path)))
+         (node root))
+    (dolist (next (cdr path))
+      (confluence--node-load node next)
+      (setq node (seq-find (lambda (k) (equal (confluence-node-id k) (alist-get 'id next)))
+                           (confluence-node-children node))))
+    (confluence--node-load node)
+    root))
+
+(defun confluence--tree-find (node id)
+  (if (equal (confluence-node-id node) id)
+      node
+    (seq-some (lambda (k) (confluence--tree-find k id))
+              (confluence-node-children node))))
+
+(defun confluence--tree-id-at-point ()
+  (get-text-property (line-beginning-position) 'confluence-id))
+
+(defun confluence--tree-insert (node depth)
+  (let* ((kids (confluence-node-children node))
+         (marker (cond ((not (confluence-node-loaded node)) "\u25b8")
+                       ((null kids) "\u2022")
+                       ((confluence-node-expanded node) "\u25be")
+                       (t "\u25b8")))
+         (start (point)))
+    (insert (make-string (* 2 depth) ?\s) marker " " (confluence-node-title node))
+    (put-text-property start (point) 'confluence-id (confluence-node-id node))
+    (when (equal (confluence-node-id node) confluence--tree-current)
+      (add-face-text-property start (point) 'confluence-tree-current))
+    (insert "\n")
+    (when (and (confluence-node-expanded node) kids)
+      (dolist (k kids)
+        (confluence--tree-insert k (1+ depth))))))
+
+(defun confluence--tree-goto (id)
+  "Move point to the line for page ID, or to the first page line."
+  (goto-char (point-min))
+  (let ((found nil))
+    (while (and id (not found) (not (eobp)))
+      (if (equal (get-text-property (line-beginning-position) 'confluence-id) id)
+          (setq found t)
+        (forward-line 1)))
+    (unless found
+      (goto-char (point-min))
+      (while (and (not (eobp)) (not (confluence--tree-id-at-point)))
+        (forward-line 1)))))
+
+(defun confluence--tree-render (&optional goto-id)
+  "Redraw the tree, leaving point on GOTO-ID (default: the line it was on)."
+  (let ((inhibit-read-only t)
+        (target (or goto-id (confluence--tree-id-at-point))))
+    (erase-buffer)
+    (insert (propertize (format "Page hierarchy - %s" (or confluence--tree-space "?")) 'face 'bold)
+            "\n"
+            (propertize "RET open  TAB expand/collapse  g rebuild  q quit" 'face 'shadow)
+            "\n\n")
+    (confluence--tree-insert confluence--tree-root 0)
+    (confluence--tree-goto target)))
+
+(defvar confluence-tree-mode-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "RET") #'confluence-tree-open)
+    (define-key m (kbd "TAB") #'confluence-tree-toggle)
+    (define-key m (kbd "g") #'confluence-tree-refresh)
+    m))
+
+(define-derived-mode confluence-tree-mode special-mode "Confluence-Tree"
+  "Major mode for browsing a Confluence page hierarchy."
+  (setq-local truncate-lines t))
+
+(defun confluence--tree-node-at-point ()
+  (let* ((id (confluence--tree-id-at-point))
+         (node (and id (confluence--tree-find confluence--tree-root id))))
+    (or node (user-error "No page on this line"))))
+
+(defun confluence-tree-toggle ()
+  "Expand or collapse the page on this line, fetching its children if needed."
+  (interactive)
+  (let ((node (confluence--tree-node-at-point)))
+    (cond ((not (confluence-node-loaded node))
+           (confluence--node-load node)
+           (unless (confluence-node-children node) (message "No child pages")))
+          ((null (confluence-node-children node))
+           (message "No child pages"))
+          (t (setf (confluence-node-expanded node)
+                   (not (confluence-node-expanded node)))))
+    (confluence--tree-render (confluence-node-id node))))
+
+(defun confluence-tree-open ()
+  "Open the page on this line."
+  (interactive)
+  (let ((node (confluence--tree-node-at-point)))
+    (unless (member (confluence-node-type node) '("page" nil))
+      (user-error "\"%s\" is a %s, not a page"
+                  (confluence-node-title node) (confluence-node-type node)))
+    (confluence-open-page (confluence-node-id node))))
+
+(defun confluence-tree-refresh ()
+  "Rebuild the tree from the current page (collapses anything you expanded)."
+  (interactive)
+  (let ((page (confluence--call "page" `((id . ,confluence--tree-current)))))
+    (setq confluence--tree-root (confluence--build-tree page))
+    (confluence--tree-render confluence--tree-current)))
+
+;;;###autoload
+(defun confluence-show-hierarchy ()
+  "Show the page hierarchy around the current page in its own buffer.
+In a page buffer this uses that page; elsewhere, the page your browser
+tab is showing."
+  (interactive)
+  (let* ((id (or (alist-get 'id confluence--page)
+                 (alist-get 'id (confluence--call "current"))
+                 (user-error "No current page")))
+         (page (if (equal id (alist-get 'id confluence--page))
+                   confluence--page
+                 (confluence--call "page" `((id . ,id)))))
+         (space (alist-get 'name (alist-get 'space page)))
+         (buf (get-buffer-create (format "*confluence tree: %s*" (or space "?")))))
+    (with-current-buffer buf
+      (confluence-tree-mode)
+      (setq confluence--tree-space space
+            confluence--tree-current id
+            confluence--tree-root (confluence--build-tree page))
+      (confluence--tree-render id))
+    (pop-to-buffer buf)))
 
 (provide 'confluence)
 ;;; confluence.el ends here
